@@ -1,0 +1,8 @@
+{
+  "active_profile": "ghost",
+  "profiles": {
+    "default": {
+      "sources": ["~/writing"]
+    }
+  }
+}

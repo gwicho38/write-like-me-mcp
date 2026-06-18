@@ -1,0 +1,16 @@
+{
+  "active_profile": "default",
+  "profiles": {
+    "default": {
+      "sources": ["~/writing", "~/blog/posts"],
+      "exclude": ["drafts/"],
+      "file_extensions": [".md", ".markdown", ".txt", ".docx", ".pdf", ".html", ".htm"]
+    },
+    "work": {
+      "sources": ["~/work/memos"],
+      "exclude": ["templates/"]
+    }
+  },
+  "data_dir": "~/.write-like-me",
+  "llm": { "enabled": false }
+}

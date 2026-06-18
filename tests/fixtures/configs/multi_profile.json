@@ -1,0 +1,12 @@
+{
+  "active_profile": "blog",
+  "profiles": {
+    "default": {
+      "sources": ["~/writing"]
+    },
+    "blog": {
+      "sources": ["~/blog/posts"],
+      "exclude": ["drafts/", "_unpublished/"]
+    }
+  }
+}

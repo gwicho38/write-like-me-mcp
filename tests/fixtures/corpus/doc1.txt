@@ -1,0 +1,5 @@
+We ship code today.
+
+Tests keep us honest.
+
+Plans stay quite simple.

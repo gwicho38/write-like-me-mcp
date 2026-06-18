@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated style profile / corpus index (may contain personal content)
+write-like-me.json
+.write-like-me/
+profile.json
+*.db
+
+# Config (may contain paths)
+.write-like-me-mcp.json
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# ============================================
+# Secrets & Environment (managed by LSH)
+# ============================================
+.env
+.env.*
+.env.local
+.env.*.local
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.p8
+*.pfx
+*.crt
+*.cer
+*-firebase-adminsdk-*.json
+service-account-key.json
+firebase-service-account*.json
+
+# IDE and OS
+.DS_Store
+.vscode/settings.json
+.idea/

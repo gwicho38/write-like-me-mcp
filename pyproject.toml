@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "write-like-me-mcp"
+version = "0.1.0"
+description = "An MCP server that learns your personal writing style from a local document corpus and provides self-updating style context to Claude."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+keywords = [
+    "mcp", "model-context-protocol", "claude", "writing", "style",
+    "documents", "corpus", "personalization", "anthropic",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Text Processing :: Linguistic",
+    "Topic :: Office/Business",
+]
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "watchdog>=4.0.0",
+    "pymupdf>=1.24.0",
+    "python-docx>=1.1.0",
+    "beautifulsoup4>=4.12.0",
+    "chardet>=5.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "mypy",
+]
+
+[project.urls]
+Homepage = "https://github.com/gwicho38/write-like-me-mcp"
+Repository = "https://github.com/gwicho38/write-like-me-mcp"
+Issues = "https://github.com/gwicho38/write-like-me-mcp/issues"
+
+[project.scripts]
+write-like-me-mcp = "write_like_me_mcp.server:main"
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src"]
+
+# PyMuPDF (fitz) ships no type stubs / py.typed marker.
+[[tool.mypy.overrides]]
+module = ["fitz"]
+ignore_missing_imports = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/write_like_me_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/"]
