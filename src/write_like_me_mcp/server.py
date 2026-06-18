@@ -729,6 +729,17 @@ async def apply_style(params: ApplyStyleInput) -> str:
         "target_metrics": target_metrics,
         "draft_metrics": draft_metrics,
     }
+    # A short draft (< MATTR window) computes lexical_diversity as plain TTR while
+    # the author corpus uses MATTR — the two numbers are not directly comparable.
+    # Surface that so a consumer does not naively diff them.
+    if draft_profile.metadata.get("ttr_fallback") and not _profile.metadata.get(
+        "ttr_fallback"
+    ):
+        payload["metric_notes"] = (
+            "draft_metrics.lexical_diversity is plain TTR (draft shorter than the "
+            "MATTR window); target_metrics.lexical_diversity is MATTR — do not "
+            "compare these two values directly."
+        )
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 

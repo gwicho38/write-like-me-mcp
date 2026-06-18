@@ -1,10 +1,14 @@
-# mcli-ci: hosted-triggers-stripped
-# Private-repo CI policy: NO auto push/pull_request/schedule triggers on hosted
-# runners. Validate locally via `mcli ci preflight` (act). Re-enable a run on
-# demand with `gh workflow run ci.yml` or the Actions UI (workflow_dispatch).
+# Public repo: hosted CI triggers are kept (free Actions minutes). The local
+# `act` / `mcli ci preflight` gate still runs before push to catch failures
+# early; hosted CI is the authoritative gate on PRs into main.
 name: CI
 
-on: workflow_dispatch
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch
 
 jobs:
   test:
