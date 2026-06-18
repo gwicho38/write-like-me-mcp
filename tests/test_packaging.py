@@ -11,8 +11,12 @@ task group, so this test deliberately does NOT import it at runtime.
 from __future__ import annotations
 
 import sys
-import tomllib
 from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # Python 3.10 has no stdlib tomllib; fall back to the tomli backport.
+    import tomli as tomllib
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT_PATH = REPO_ROOT / "pyproject.toml"
