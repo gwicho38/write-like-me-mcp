@@ -87,7 +87,7 @@ def test_metadata_has_schema_version_and_iso8601_generated_at(tmp_path: Path) ->
     assert restored is not None
 
     assert restored.metadata["schema_version"] == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 1
+    assert SCHEMA_VERSION == 2
 
     generated_at = restored.metadata["generated_at"]
     # Must be a string that parses as ISO8601 (raises ValueError otherwise).
@@ -171,3 +171,20 @@ def test_non_ascii_preserved(tmp_path: Path) -> None:
     assert restored is not None
     assert restored.signature_phrases == profile.signature_phrases
     assert restored.style_guide_md == profile.style_guide_md
+
+
+def test_profile_written_before_languages_field_still_loads(tmp_path: Path) -> None:
+    """A schema-version-1 profile.json has no ``languages`` key.
+
+    Loading must not raise; the field defaults to empty so an existing install
+    keeps working across the upgrade without a forced rebuild.
+    """
+    legacy = _sample_profile().to_dict()
+    del legacy["languages"]
+    legacy["metadata"]["schema_version"] = 1
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    restored = StyleProfile.load(path)
+    assert restored is not None
+    assert restored.languages == {}

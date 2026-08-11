@@ -654,6 +654,46 @@ async def get_style_profile(params: GetProfileInput) -> str:
     return json.dumps(_profile.to_dict(), indent=2, ensure_ascii=False)
 
 
+def _target_metrics_for(
+    profile: StyleProfile, draft_profile: StyleProfile
+) -> tuple[dict, str | None]:
+    """Return the author metrics a draft should be compared against.
+
+    Passive voice and contraction habits only mean something within one
+    grammar, so a draft is measured against the author's metrics *in the
+    draft's own language* when the corpus contains that language. Otherwise the
+    top-level (dominant-language) metrics are used.
+
+    Args:
+        profile: The author's built style profile.
+        draft_profile: The profile computed for the draft text.
+
+    Returns:
+        A ``(metrics, matched_language)`` pair. ``matched_language`` is the ISO
+        code whose metrics were used, or ``None`` when the draft's language is
+        not represented in the corpus and the dominant metrics were used.
+    """
+    metrics = {
+        "avg_sentence_length": profile.avg_sentence_length,
+        "median_sentence_length": profile.median_sentence_length,
+        "lexical_diversity": profile.lexical_diversity,
+        "contraction_rate": profile.contraction_rate,
+        "passive_voice_rate": profile.passive_voice_rate,
+        "punctuation_per_1k": profile.punctuation_per_1k,
+        "formality_markers": profile.formality_markers,
+    }
+
+    draft_language = draft_profile.metadata.get("dominant_language")
+    entry = profile.languages.get(draft_language) if draft_language else None
+    if entry is None:
+        return metrics, None
+
+    metrics["contraction_rate"] = entry["contraction_rate"]
+    metrics["passive_voice_rate"] = entry["passive_voice_rate"]
+    metrics["formality_markers"] = entry["formality_markers"]
+    return metrics, draft_language
+
+
 @mcp.tool(
     name="apply_style",
     annotations=ToolAnnotations(
@@ -700,15 +740,7 @@ async def apply_style(params: ApplyStyleInput) -> str:
     profile_name = params.profile or (_config.profile_name if _config else "draft")
     draft_profile = analyze_text(params.draft_text, f"{profile_name}:draft")
 
-    target_metrics = {
-        "avg_sentence_length": _profile.avg_sentence_length,
-        "median_sentence_length": _profile.median_sentence_length,
-        "lexical_diversity": _profile.lexical_diversity,
-        "contraction_rate": _profile.contraction_rate,
-        "passive_voice_rate": _profile.passive_voice_rate,
-        "punctuation_per_1k": _profile.punctuation_per_1k,
-        "formality_markers": _profile.formality_markers,
-    }
+    target_metrics, matched_language = _target_metrics_for(_profile, draft_profile)
     draft_metrics = {
         "avg_sentence_length": draft_profile.avg_sentence_length,
         "median_sentence_length": draft_profile.median_sentence_length,
@@ -725,6 +757,7 @@ async def apply_style(params: ApplyStyleInput) -> str:
         "observations": _draft_observations(draft_profile, _profile),
         "target_metrics": target_metrics,
         "draft_metrics": draft_metrics,
+        "matched_language": matched_language,
     }
     # A short draft (< MATTR window) computes lexical_diversity as plain TTR while
     # the author corpus uses MATTR — the two numbers are not directly comparable.

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "write-like-me-mcp"
-version = "0.1.1"
+version = "0.2.0"
 description = "An MCP server that learns your personal writing style from a local document corpus and provides self-updating style context to Claude."
 readme = "README.md"
 license = "MIT"

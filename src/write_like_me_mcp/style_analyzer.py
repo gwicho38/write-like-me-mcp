@@ -40,6 +40,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .extractors import extract_text
+from .language import (
+    DEFAULT_LANGUAGE,
+    LANGUAGE_NAMES,
+    UNKNOWN_LANGUAGE,
+    LanguageRules,
+    detect_language,
+    rules_for,
+)
 from .model import SCHEMA_VERSION, StyleProfile
 
 logger = logging.getLogger(__name__)
@@ -176,8 +184,9 @@ PER_1K: int = 1000
 # --------------------------------------------------------------------------- #
 
 #: Word token: runs of letters/digits, allowing internal apostrophes so that
-#: contractions ("can't", "won't") survive as single tokens.
-_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z]+)?")
+#: contractions ("can't") and elisions ("l'équipe") survive as single tokens.
+#: Unicode-aware, so accented words are not truncated at the first accent.
+_WORD_RE = re.compile(r"[^\W_]+(?:['\u2019][^\W_]+)?", re.UNICODE)
 
 #: Sentence terminators. Sentences are split on ., !, ? (one or more), keeping
 #: this deterministic and dependency-free.
@@ -317,26 +326,40 @@ def _punctuation_per_1k(text: str, total_words: int) -> dict:
     return rates
 
 
-def _contraction_rate(tokens: list[str], total_words: int) -> float:
-    """Return contractions per 1k words (regex approximation, not a parser)."""
+def _contraction_rate(
+    tokens: list[str], total_words: int, rules: LanguageRules
+) -> float:
+    """Return contractions per 1k words (regex approximation, not a parser).
+
+    Mandatory elisions are skipped: ``l'équipe`` in French is grammar, not the
+    stylistic choice that ``don't`` represents in English, so counting it would
+    describe a habit the author does not have.
+    """
     denom = total_words if total_words > 0 else 1
-    contractions = sum(1 for t in tokens if "'" in t)
+    contractions = 0
+    for token in tokens:
+        if "'" not in token and "\u2019" not in token:
+            continue
+        prefix = re.split(r"['\u2019]", token, maxsplit=1)[0].lower()
+        if prefix in rules.mandatory_elisions:
+            continue
+        contractions += 1
     return round(contractions / denom * PER_1K, 4)
 
 
-def _is_participle(token: str) -> bool:
-    """Heuristic: does ``token`` look like a past participle?
+def _is_participle(token: str, rules: LanguageRules) -> bool:
+    """Heuristic: does ``token`` look like a past participle in ``rules``?
 
-    Approximation per spec: matches ``\\w+(ed|en)`` or a known irregular
-    participle. Not a linguistic parser.
+    Matches the language's participle suffix pattern or one of its known
+    irregular participles. Not a linguistic parser.
     """
     low = token.lower()
-    if low in IRREGULAR_PARTICIPLES:
+    if low in rules.irregular_participles:
         return True
-    return bool(_PARTICIPLE_RE.match(low))
+    return bool(rules.participle_suffixes.match(low))
 
 
-def _passive_voice_rate(sentences: list[str]) -> float:
+def _passive_voice_rate(sentences: list[str], rules: LanguageRules) -> float:
     """Return heuristic passive constructions per 1k sentences.
 
     Heuristic (approximation, not a parser): a sentence is counted as passive
@@ -351,13 +374,13 @@ def _passive_voice_rate(sentences: list[str]) -> float:
     for sentence in sentences:
         words = _tokenize_words(sentence)
         for i, word in enumerate(words):
-            if word not in BE_VERBS:
+            if word not in rules.be_verbs:
                 continue
             # be-verb directly followed by a participle, or with one
             # intervening adverb-like token.
             for offset in (1, 2):
                 j = i + offset
-                if j < len(words) and _is_participle(words[j]):
+                if j < len(words) and _is_participle(words[j], rules):
                     passive_hits += 1
                     break
             else:
@@ -366,12 +389,14 @@ def _passive_voice_rate(sentences: list[str]) -> float:
     return round(passive_hits / len(sentences) * PER_1K, 4)
 
 
-def _formality_markers(tokens: list[str], total_words: int) -> dict:
+def _formality_markers(
+    tokens: list[str], total_words: int, rules: LanguageRules
+) -> dict:
     """Return first/second-person and hedging rates (per 1k words)."""
     denom = total_words if total_words > 0 else 1
-    first = sum(1 for t in tokens if t in FIRST_PERSON)
-    second = sum(1 for t in tokens if t in SECOND_PERSON)
-    hedging = sum(1 for t in tokens if t in HEDGING_WORDS)
+    first = sum(1 for t in tokens if t in rules.first_person)
+    second = sum(1 for t in tokens if t in rules.second_person)
+    hedging = sum(1 for t in tokens if t in rules.hedging)
     return {
         "first_person_rate": round(first / denom * PER_1K, 4),
         "second_person_rate": round(second / denom * PER_1K, 4),
@@ -456,6 +481,8 @@ def _build_style_guide(
     passive_voice_rate: float,
     formality_markers: dict,
     signature_phrases: list[dict],
+    dominant_language: str = DEFAULT_LANGUAGE,
+    languages: dict | None = None,
 ) -> str:
     """Distill the metrics into deterministic Markdown prose (no LLM).
 
@@ -464,6 +491,21 @@ def _build_style_guide(
     capped/floored signature phrases — never verbatim corpus sentences.
     """
     lines: list[str] = ["# Writing Style Guide", ""]
+
+    languages = languages or {}
+    dominant_name = LANGUAGE_NAMES.get(dominant_language, dominant_language)
+    lines.append("## Language")
+    lines.append(
+        f"These metrics describe the author's **{dominant_name}** writing."
+    )
+    others = sorted(c for c in languages if c != dominant_language)
+    if others:
+        other_names = ", ".join(LANGUAGE_NAMES.get(c, c) for c in others)
+        lines.append(
+            f"The corpus also contains {other_names}; see `languages` in the "
+            "profile for each one's own metrics."
+        )
+    lines.append("")
 
     # Sentence rhythm.
     if median_sentence_length < SHORT_VOICE_MEDIAN_THRESHOLD:
@@ -531,6 +573,48 @@ def _build_style_guide(
 # --------------------------------------------------------------------------- #
 
 
+def _language_metrics(per_doc_texts: list[str], code: str) -> dict:
+    """Compute the language-sensitive metrics for one language's documents.
+
+    Args:
+        per_doc_texts: Documents detected as being written in ``code``.
+        code: ISO 639-1 code whose rule table is applied.
+
+    Returns:
+        A JSON-serializable summary: document and word counts plus the metrics
+        that only mean something relative to a specific grammar.
+    """
+    rules = rules_for(code)
+    text = "\n\n".join(per_doc_texts)
+    tokens = _tokenize_words(text)
+    total_words = len(tokens)
+    sentences = _split_sentences(text)
+
+    return {
+        "doc_count": len(per_doc_texts),
+        "total_words": total_words,
+        "passive_voice_rate": _passive_voice_rate(sentences, rules),
+        "contraction_rate": _contraction_rate(tokens, total_words, rules),
+        "formality_markers": _formality_markers(tokens, total_words, rules),
+    }
+
+
+def _group_by_language(per_doc_texts: list[str]) -> dict[str, list[str]]:
+    """Group documents by detected language, dropping undetectable ones.
+
+    Documents with no language signal (name lists, tables of numbers) are
+    omitted rather than bucketed under a pseudo-language, so they cannot drag a
+    real language's metrics.
+    """
+    grouped: dict[str, list[str]] = {}
+    for text in per_doc_texts:
+        code = detect_language(text)
+        if code == UNKNOWN_LANGUAGE:
+            continue
+        grouped.setdefault(code, []).append(text)
+    return grouped
+
+
 def _assemble_profile(
     per_doc_texts: list[str],
     profile_name: str,
@@ -539,10 +623,26 @@ def _assemble_profile(
 ) -> StyleProfile:
     """Compute every metric from per-document texts and assemble a profile.
 
+    Language-sensitive metrics (passive voice, contractions, formality) are
+    computed per detected language and reported in ``languages``. The top-level
+    fields describe the **dominant** language, so a multilingual corpus is never
+    summarized as a blend of grammars that share no auxiliaries.
+
     No verbatim corpus text reaches the returned profile: only aggregates,
     capped/floored signature phrases, and templated prose.
     """
     full_text = "\n\n".join(per_doc_texts)
+
+    by_language = _group_by_language(per_doc_texts)
+    languages = {
+        code: _language_metrics(texts, code) for code, texts in by_language.items()
+    }
+    dominant_language = (
+        max(languages, key=lambda c: languages[c]["total_words"])
+        if languages
+        else DEFAULT_LANGUAGE
+    )
+    dominant_rules = rules_for(dominant_language)
 
     all_tokens = _tokenize_words(full_text)
     total_words = len(all_tokens)
@@ -567,9 +667,15 @@ def _assemble_profile(
     )
     lexical_diversity, ttr_fallback = _lexical_diversity(all_tokens)
     punctuation = _punctuation_per_1k(full_text, total_words)
-    contraction_rate = _contraction_rate(all_tokens, total_words)
-    passive_voice_rate = _passive_voice_rate(sentences)
-    formality_markers = _formality_markers(all_tokens, total_words)
+    dominant = languages.get(dominant_language)
+    if dominant is not None:
+        contraction_rate = dominant["contraction_rate"]
+        passive_voice_rate = dominant["passive_voice_rate"]
+        formality_markers = dominant["formality_markers"]
+    else:
+        contraction_rate = _contraction_rate(all_tokens, total_words, dominant_rules)
+        passive_voice_rate = _passive_voice_rate(sentences, dominant_rules)
+        formality_markers = _formality_markers(all_tokens, total_words, dominant_rules)
 
     per_doc_tokens = [_tokenize_words(t) for t in per_doc_texts]
     signature_phrases = _signature_phrases(per_doc_tokens)
@@ -582,6 +688,8 @@ def _assemble_profile(
         passive_voice_rate=passive_voice_rate,
         formality_markers=formality_markers,
         signature_phrases=signature_phrases,
+        dominant_language=dominant_language,
+        languages=languages,
     )
 
     metadata = {
@@ -593,6 +701,7 @@ def _assemble_profile(
         "schema_version": SCHEMA_VERSION,
         "ttr_fallback": ttr_fallback,
         "sources": source_basenames,
+        "dominant_language": dominant_language,
     }
 
     return StyleProfile(
@@ -608,6 +717,7 @@ def _assemble_profile(
         formality_markers=formality_markers,
         style_guide_md=style_guide_md,
         metadata=metadata,
+        languages=languages,
     )
 
 
@@ -634,6 +744,36 @@ def analyze_text(
     basenames = [Path(p).name for p in paths]
     return _assemble_profile(
         per_doc_texts=[text],
+        profile_name=profile_name,
+        source_basenames=basenames,
+        source_count=len(basenames),
+    )
+
+
+def analyze_documents(
+    documents: list[str],
+    profile_name: str,
+    source_paths: list[Path] | None = None,
+) -> StyleProfile:
+    """Build a :class:`StyleProfile` from several in-memory documents.
+
+    Unlike :func:`analyze_text`, each entry is treated as its own document, so
+    language detection and the signature-phrase dispersion floor both operate
+    per document. Use this when the caller already holds extracted text for a
+    multi-document corpus.
+
+    Args:
+        documents: One text per document.
+        profile_name: Name recorded in ``metadata.profile_name``.
+        source_paths: Optional source paths; only their **basenames** are
+            recorded (privacy invariant).
+
+    Returns:
+        A computed :class:`StyleProfile` (no verbatim text persisted).
+    """
+    basenames = [Path(p).name for p in (source_paths or [])]
+    return _assemble_profile(
+        per_doc_texts=documents,
         profile_name=profile_name,
         source_basenames=basenames,
         source_count=len(basenames),
