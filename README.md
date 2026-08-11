@@ -167,6 +167,38 @@ export WRITE_LIKE_ME_CONFIG="/path/to/your/write-like-me.json"
 | HTML | `.html`, `.htm` | Boilerplate (`script`/`style`/`nav`) stripped |
 | Rich Text | `.rtf` | **Not supported in v0.1** — the plain reader would leak RTF control codes into the corpus and corrupt the metrics; proper handling is deferred. |
 
+## Multilingual Corpora
+
+Several style metrics only mean something against the grammar of the language a
+document is written in. Passive voice is found by looking for auxiliary verbs;
+hedging and formality come from closed word lists; an apostrophe marks a
+stylistic contraction in English but a mandatory elision in French. Applying one
+language's tables to another does not lose signal quietly — it reports
+confident, wrong numbers.
+
+So the analyzer detects each document's language and reports metrics per
+language:
+
+- **Detection** is stopword-based: no dependency, no model file, no network, and
+  fully deterministic. Supported: English, French, Spanish, Portuguese, Italian.
+- **Abstention over guessing.** A document with too few function words — a list
+  of names and dates, a table of numbers, a code dump — or one that does not
+  favour a language clearly over the runner-up is left out of the breakdown
+  rather than bucketed on thin evidence.
+- **`profile.languages`** maps each detected language to its own
+  `doc_count`, `total_words`, `passive_voice_rate`, `contraction_rate`, and
+  `formality_markers`.
+- **Top-level metrics describe the dominant language**, recorded as
+  `metadata.dominant_language`. A single-language corpus is therefore reported
+  exactly as before.
+- **`apply_style` matches the draft's language.** A French draft is compared
+  against your French metrics when your corpus has them; the response's
+  `matched_language` says which set was used, or `null` when the draft's
+  language is not represented and the dominant metrics were used instead.
+
+Tokenization is Unicode-aware, so accented words (`réunion`, `niño`) count as
+one whole token rather than being truncated at the first accent.
+
 ## Available Tools
 
 Once configured, Claude gains access to these five tools:

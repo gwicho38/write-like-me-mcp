@@ -1,14 +1,16 @@
 """StyleProfile model and JSON persistence for write-like-me-mcp.
 
-This module defines the :class:`StyleProfile` dataclass — the frozen v0.1
-schema describing a learned writing style — together with its human-readable
-JSON serialization.
+This module defines the :class:`StyleProfile` dataclass — the schema
+describing a learned writing style — together with its human-readable JSON
+serialization.
 
-Schema contract (frozen for v0.1)
----------------------------------
-The 12 fields of :class:`StyleProfile` are the persistence contract. They are
+Schema contract
+---------------
+The fields of :class:`StyleProfile` are the persistence contract. They are
 written verbatim to ``profile.json`` under ``<data_root>/<profile>/`` and read
-back with typed reconstruction.
+back with typed reconstruction. Fields added after the initial release carry a
+default so that a profile written by an older version still loads;
+``SCHEMA_VERSION`` records which set was written.
 
 Privacy invariants
 ------------------
@@ -23,18 +25,18 @@ Privacy invariants
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, fields
+from dataclasses import MISSING, asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 #: Version of the on-disk ``profile.json`` schema. Bump on breaking changes to
 #: the :class:`StyleProfile` field set so loaders can detect incompatibility.
-SCHEMA_VERSION: int = 1
+SCHEMA_VERSION: int = 2
 
 
 @dataclass
 class StyleProfile:
-    """A learned writing-style profile (frozen v0.1 schema).
+    """A learned writing-style profile.
 
     Each field is a derived statistic or artifact computed from a user's
     document corpus. The full set of fields is the persistence contract; see
@@ -62,6 +64,11 @@ class StyleProfile:
             ``source_count``, ``doc_count``, ``total_words``, ``generated_at``
             (ISO8601 string), ``schema_version`` (``SCHEMA_VERSION``). Values
             must be basenames/relative paths or scalars — never absolute paths.
+        languages: Per-language metric breakdown keyed by ISO 639-1 code. The
+            top-level metric fields describe the dominant language; this maps
+            every detected language to its own metrics so a multilingual
+            corpus is not reported as a blend. Empty for profiles written
+            before schema version 2.
     """
 
     avg_sentence_length: float
@@ -76,6 +83,7 @@ class StyleProfile:
     formality_markers: dict
     style_guide_md: str
     metadata: dict
+    languages: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain ``dict`` representation of this profile.
@@ -116,7 +124,8 @@ class StyleProfile:
 
         Only the known schema fields are consumed; any extra keys in ``data``
         are ignored so that forward-compatible additions do not break loading
-        of older readers.
+        of older readers. Fields carrying a default are optional, so a profile
+        written by an earlier schema version still loads.
 
         Args:
             data: Mapping containing the profile's fields.
@@ -127,8 +136,12 @@ class StyleProfile:
         Raises:
             KeyError: If a required schema field is missing from ``data``.
         """
-        field_names = {f.name for f in fields(cls)}
-        kwargs = {name: data[name] for name in field_names}
+        kwargs = {}
+        for f in fields(cls):
+            if f.name in data:
+                kwargs[f.name] = data[f.name]
+            elif f.default is MISSING and f.default_factory is MISSING:
+                raise KeyError(f.name)
         return cls(**kwargs)
 
     @classmethod
