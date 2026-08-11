@@ -49,7 +49,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver
 
-from .config import StyleConfig
+from .config import StyleConfig, is_excluded
 
 # ---------------------------------------------------------------------------
 # Named constants (no magic literals)
@@ -177,12 +177,7 @@ class _DebouncedHandler(FileSystemEventHandler):
         # Only configured analyzed extensions are relevant.
         if file_path.suffix.lower() not in self._config.file_extensions:
             return False
-        # Skip excluded path substrings (matched against path components).
-        parts = file_path.parts
-        for excluded in self._config.exclude:
-            if excluded and excluded in parts:
-                return False
-        return True
+        return not is_excluded(file_path, self._config.exclude)
 
 
 # ---------------------------------------------------------------------------

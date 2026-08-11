@@ -8,6 +8,33 @@ import chardet
 
 logger = logging.getLogger(__name__)
 
+#: Extensions treated as Markdown, and so stripped of non-prose structure.
+MARKDOWN_EXTENSIONS: frozenset[str] = frozenset({".md", ".markdown"})
+
+#: Leading YAML/TOML frontmatter block, only when it opens the document.
+_FRONTMATTER_RE = re.compile(r"\A(?:---|\+\+\+)\r?\n.*?\r?\n(?:---|\+\+\+)\s*?(?:\r?\n|\Z)", re.DOTALL)
+
+#: Fenced code blocks (``` or ~~~), including the info string and body.
+_FENCED_CODE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,}).*?(?:^[ \t]*\1[ \t]*$|\Z)", re.DOTALL | re.MULTILINE)
+
+
+def strip_markdown_structure(text: str) -> str:
+    """Remove non-prose Markdown scaffolding so only authored sentences remain.
+
+    Frontmatter keys and code identifiers are metadata, not writing. Leaving
+    them in lets ``tags: [...]`` lines count as sentences, which skews the
+    sentence-length and passive-voice metrics and lets metadata bigrams
+    outrank real phrases in the signature-phrase ranking.
+
+    Args:
+        text: Raw Markdown source.
+
+    Returns:
+        The text with leading frontmatter and fenced code blocks removed.
+    """
+    without_frontmatter = _FRONTMATTER_RE.sub("", text, count=1)
+    return _FENCED_CODE_RE.sub("", without_frontmatter)
+
 
 def extract_text(file_path: Path) -> str | None:
     """Extract text content from a file based on its extension.
@@ -20,7 +47,9 @@ def extract_text(file_path: Path) -> str | None:
     """
     suffix = file_path.suffix.lower()
     try:
-        if suffix in (".txt", ".md", ".markdown"):
+        if suffix in MARKDOWN_EXTENSIONS:
+            return strip_markdown_structure(_extract_plain_text(file_path))
+        elif suffix == ".txt":
             return _extract_plain_text(file_path)
         elif suffix == ".pdf":
             return _extract_pdf(file_path)

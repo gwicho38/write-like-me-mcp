@@ -76,7 +76,7 @@ which profile is active.
   "profiles": {
     "default": {
       "sources": ["~/writing", "~/notes"],
-      "exclude": ["drafts/"],
+      "exclude": ["drafts/", "_Index_of_*"],
       "file_extensions": [".md", ".markdown", ".txt", ".docx", ".pdf", ".html", ".htm"]
     },
     "work": {
@@ -92,7 +92,7 @@ which profile is active.
 | `active_profile` | yes | — | Which entry in `profiles` to build and serve. |
 | `profiles` | yes | — | Map of profile name → settings. The schema is multi-profile-ready; v0.1 builds only the active one. |
 | `profiles.<name>.sources` | yes | — | Directories and/or files to learn from (`~` expanded). |
-| `profiles.<name>.exclude` | no | `[]` | Path components to skip during the scan. |
+| `profiles.<name>.exclude` | no | `[]` | Path components or globs to skip. Matches a whole component (`"drafts"`, `"drafts/"`), a component glob (`"_Index_of_*"`), or the full path (`"*/archive/*"`). Bare substrings do not match. |
 | `profiles.<name>.file_extensions` | no | see table below | Which extensions to analyze. |
 | `data_dir` | no | `~/.write-like-me` | Where `profile.json` + `examples.db` are written. |
 | `llm.enabled` | no | `false` | Reserved for a future server-side rewrite path; **always `false` in v0.1**. |
@@ -160,7 +160,8 @@ export WRITE_LIKE_ME_CONFIG="/path/to/your/write-like-me.json"
 
 | Format | Extensions | Notes |
 |--------|------------|-------|
-| Plain text | `.txt`, `.md`, `.markdown` | UTF-8 with encoding fallback |
+| Plain text | `.txt` | UTF-8 with encoding fallback |
+| Markdown | `.md`, `.markdown` | UTF-8 with encoding fallback; leading YAML/TOML frontmatter and fenced code blocks are stripped so metadata and code do not count as prose |
 | PDF | `.pdf` | Extracted with PyMuPDF |
 | Word | `.docx` | Headings + tables preserved |
 | HTML | `.html`, `.htm` | Boilerplate (`script`/`style`/`nav`) stripped |

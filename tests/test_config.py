@@ -17,6 +17,7 @@ import pytest
 
 from write_like_me_mcp.config import (
     ConfigError,
+    is_excluded,
     DEFAULT_DATA_ROOT_NAME,
     DEFAULT_FILE_EXTENSIONS,
     StyleConfig,
@@ -325,3 +326,46 @@ def test_unknown_top_level_keys_are_tolerated(tmp_path, monkeypatch):
 
     assert isinstance(config, StyleConfig)
     assert config.profile_name == "default"
+
+
+# --- Exclusion matching (regression) ----------------------------------------
+
+
+class TestIsExcluded:
+    """``is_excluded`` honours the documented "substrings / globs" contract.
+
+    The original implementation compared each pattern for equality against the
+    path components, so a filename glob could never match and the documented
+    glob support did not exist.
+    """
+
+    def test_exact_component_still_matches(self) -> None:
+        assert is_excluded(Path("/corpus/node_modules/pkg/readme.md"), ["node_modules"])
+
+    def test_filename_glob_matches(self) -> None:
+        assert is_excluded(Path("/corpus/notes/_Index_of_lefv.md"), ["_Index_of_*"])
+
+    def test_directory_glob_matches(self) -> None:
+        assert is_excluded(Path("/corpus/.obsidian-cache/note.md"), [".obsidian*"])
+
+    def test_full_path_glob_matches(self) -> None:
+        assert is_excluded(Path("/corpus/vault/archive/old.md"), ["*/archive/*"])
+
+    def test_non_matching_pattern_is_not_excluded(self) -> None:
+        assert not is_excluded(Path("/corpus/notes/real-note.md"), ["_Index_of_*"])
+
+    def test_partial_component_does_not_match_without_glob(self) -> None:
+        """A bare substring is not a glob; requiring an explicit ``*`` keeps
+        ``exclude: ["notes"]`` from silently dropping ``my-notes-archive``."""
+        assert not is_excluded(Path("/corpus/my-notes-archive/a.md"), ["notes"])
+
+    def test_empty_patterns_exclude_nothing(self) -> None:
+        assert not is_excluded(Path("/corpus/a.md"), [])
+
+    def test_blank_pattern_is_ignored(self) -> None:
+        assert not is_excluded(Path("/corpus/a.md"), ["", "   "])
+
+    def test_trailing_slash_directory_pattern_matches(self) -> None:
+        """The README documents ``"drafts/"``; a trailing separator must not
+        stop it matching the ``drafts`` component."""
+        assert is_excluded(Path("/corpus/drafts/wip.md"), ["drafts/"])
