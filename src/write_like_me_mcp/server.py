@@ -44,7 +44,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
-from .config import ConfigError, StyleConfig, load_config
+from .config import ConfigError, StyleConfig, is_excluded, load_config
 from .extractors import extract_text
 from .indexer import ExcerptIndex
 from .model import StyleProfile
@@ -132,7 +132,6 @@ def _collect_corpus_files(config: StyleConfig) -> list[Path]:
         A sorted, de-duplicated list of corpus file paths.
     """
     extensions = {e.lower() for e in config.file_extensions}
-    excluded = {e for e in config.exclude if e}
 
     def _is_relevant(path: Path) -> bool:
         name = path.name
@@ -140,9 +139,7 @@ def _collect_corpus_files(config: StyleConfig) -> list[Path]:
             return False
         if path.suffix.lower() not in extensions:
             return False
-        if excluded and excluded.intersection(path.parts):
-            return False
-        return True
+        return not is_excluded(path, config.exclude)
 
     found: set[Path] = set()
     for source in config.resolved_sources:

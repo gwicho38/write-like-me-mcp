@@ -172,3 +172,68 @@ def test_logging_does_not_write_to_stdout(
     extract_text(_make_malformed_docx(fixtures_dir))
     captured = capsys.readouterr()
     assert captured.out == "", f"unexpected stdout output: {captured.out!r}"
+
+
+# --- Markdown structural noise is stripped (regression) ---------------------
+
+
+def test_yaml_frontmatter_is_stripped_from_markdown(fixtures_dir: Path) -> None:
+    """Frontmatter keys must not reach the analyzer as author prose.
+
+    A vault-style note carries a YAML block whose keys ("type: note",
+    "tags: [...]") are metadata, not sentences. Counting them inflates the
+    passive-voice rate and lets metadata bigrams win the signature-phrase
+    ranking over real writing.
+    """
+    md = fixtures_dir / "note.md"
+    md.write_text(
+        "---\n"
+        "id: Note\n"
+        "type: note\n"
+        "tags: [aws, daily-notes, personal]\n"
+        "---\n"
+        f"{MD_MARKER} body sentence.\n",
+        encoding="utf-8",
+    )
+    text = extract_text(md)
+    assert text is not None
+    assert MD_MARKER in text
+    for key in ("type: note", "tags:", "id: Note"):
+        assert key not in text
+
+
+def test_frontmatter_only_stripped_at_start_of_file(fixtures_dir: Path) -> None:
+    """A horizontal rule mid-document is content, not a frontmatter fence."""
+    md = fixtures_dir / "rule.md"
+    md.write_text(f"{MD_MARKER} opening.\n\n---\n\nclosing sentence.\n", encoding="utf-8")
+    text = extract_text(md)
+    assert text is not None
+    assert "closing sentence." in text
+
+
+def test_fenced_code_blocks_are_stripped_from_markdown(fixtures_dir: Path) -> None:
+    """Code is not prose — fenced blocks must not feed the style metrics."""
+    md = fixtures_dir / "code.md"
+    md.write_text(
+        f"{MD_MARKER} explains the call.\n\n"
+        "```python\n"
+        "def sneaky_identifier(x):\n"
+        "    return x\n"
+        "```\n\n"
+        "trailing sentence.\n",
+        encoding="utf-8",
+    )
+    text = extract_text(md)
+    assert text is not None
+    assert MD_MARKER in text
+    assert "trailing sentence." in text
+    assert "sneaky_identifier" not in text
+
+
+def test_plain_text_files_keep_their_content_verbatim(fixtures_dir: Path) -> None:
+    """.txt is not markdown: no stripping is applied to it."""
+    txt = fixtures_dir / "note.txt"
+    txt.write_text("---\nnot: frontmatter\n---\nbody\n", encoding="utf-8")
+    text = extract_text(txt)
+    assert text is not None
+    assert "not: frontmatter" in text

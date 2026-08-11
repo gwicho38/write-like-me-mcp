@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -62,6 +64,43 @@ DEFAULT_FILE_EXTENSIONS: list[str] = [
 
 #: Default (empty) exclusion list when a profile omits ``exclude``.
 DEFAULT_EXCLUDE: list[str] = []
+
+
+# ---------------------------------------------------------------------------
+# Exclusion matching
+# ---------------------------------------------------------------------------
+
+
+def is_excluded(file_path: Path, patterns: Iterable[str]) -> bool:
+    """Return whether ``file_path`` matches any exclusion pattern.
+
+    A pattern matches when it equals a single path component, or when it is a
+    glob (``fnmatch`` syntax) matching a component or the whole path. Bare
+    substrings do not match, so ``"notes"`` cannot silently drop
+    ``my-notes-archive/``.
+
+    Args:
+        file_path: Candidate corpus path.
+        patterns: Exclusion patterns from the active profile.
+
+    Returns:
+        ``True`` when the path should be excluded from the scan.
+    """
+    parts = file_path.parts
+    whole = file_path.as_posix()
+    for raw in patterns:
+        # A trailing separator is how users write "this directory" (and how
+        # the README documents it); it is not part of the component name.
+        pattern = raw.strip().rstrip("/\\")
+        if not pattern:
+            continue
+        if pattern in parts:
+            return True
+        if any(fnmatch(part, pattern) for part in parts):
+            return True
+        if fnmatch(whole, pattern):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------

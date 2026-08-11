@@ -24,7 +24,7 @@ GITIGNORE_PATH = REPO_ROOT / ".gitignore"
 LICENSE_PATH = REPO_ROOT / "LICENSE"
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 
-EXPECTED_VERSION = "0.1.0"
+EXPECTED_VERSION = "0.1.1"
 EXPECTED_ENTRY_POINT = "write_like_me_mcp.server:main"
 EXPECTED_WHEEL_PACKAGE = "src/write_like_me_mcp"
 REQUIRED_GITIGNORE_PATTERNS = [
@@ -41,7 +41,7 @@ def _load_pyproject() -> dict:
 
 
 def test_version_importable_and_correct() -> None:
-    """__version__ is importable from the package and equals 0.1.0."""
+    """__version__ is importable from the package and equals 0.1.1."""
     src_path = str(REPO_ROOT / "src")
     if src_path not in sys.path:
         sys.path.insert(0, src_path)
