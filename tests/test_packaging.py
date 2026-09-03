@@ -24,7 +24,7 @@ GITIGNORE_PATH = REPO_ROOT / ".gitignore"
 LICENSE_PATH = REPO_ROOT / "LICENSE"
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 
-EXPECTED_VERSION = "0.2.0"
+EXPECTED_VERSION = "0.2.1"
 EXPECTED_ENTRY_POINT = "write_like_me_mcp.server:main"
 EXPECTED_WHEEL_PACKAGE = "src/write_like_me_mcp"
 REQUIRED_GITIGNORE_PATTERNS = [
@@ -41,7 +41,7 @@ def _load_pyproject() -> dict:
 
 
 def test_version_importable_and_correct() -> None:
-    """__version__ is importable from the package and equals 0.2.0."""
+    """__version__ is importable from the package and equals 0.2.1."""
     src_path = str(REPO_ROOT / "src")
     if src_path not in sys.path:
         sys.path.insert(0, src_path)
@@ -63,6 +63,13 @@ def test_pyproject_metadata() -> None:
 
     wheel_packages = data["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]
     assert EXPECTED_WHEEL_PACKAGE in wheel_packages
+
+
+def test_mcp_dependency_excludes_incompatible_v2() -> None:
+    """The v1 FastMCP import must not resolve to the incompatible mcp 2.x API."""
+    dependencies = _load_pyproject()["project"]["dependencies"]
+
+    assert "mcp[cli]>=1.0.0,<2" in dependencies
 
 
 def test_gitignore_contains_safety_patterns() -> None:
