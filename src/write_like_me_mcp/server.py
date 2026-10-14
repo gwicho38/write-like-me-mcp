@@ -32,13 +32,21 @@ All diagnostic logging goes to **stderr** — stdout is the MCP protocol channel
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import sys
 import threading
+import time
+from collections import Counter
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import IO, Optional
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - fcntl is POSIX-only (macOS/Linux target)
+    fcntl = None  # type: ignore[assignment]
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -48,7 +56,8 @@ from .config import ConfigError, StyleConfig, is_excluded, load_config
 from .extractors import extract_text
 from .indexer import ExcerptIndex
 from .model import StyleProfile
-from .style_analyzer import analyze_corpus, analyze_text
+from .prose_filter import is_prose
+from .style_analyzer import analyze_documents, analyze_text
 from .watcher import WorkspaceWatcher
 
 # ---------------------------------------------------------------------------
@@ -115,6 +124,31 @@ _build_thread_lock: threading.Lock = threading.Lock()
 #: Set when the background corpus build completes; tools await this.
 _profile_ready: asyncio.Event = asyncio.Event()
 
+#: In-process cache of extracted text, keyed by resolved file path, storing
+#: ``(mtime_ns, size, text)``. A corpus build reuses a cache hit instead of
+#: re-running ``extract_text`` for files unchanged since they were last read —
+#: unavoidable on first sight of a file, but every subsequent rebuild triggered
+#: by the watcher (one full corpus rebuild per changed file, per its own
+#: docstring) otherwise re-extracts *every* file in the corpus, not just the
+#: one that changed. Process-lifetime only: never persisted, so this does not
+#: touch the "no verbatim corpus text is ever persisted" privacy invariant —
+#: the text is already transiently in memory during any build regardless.
+_extract_cache: dict[Path, tuple[int, int, str]] = {}
+
+#: Filename of the cross-process advisory lock file within ``profile_dir``.
+#: All Claude Code sessions on a machine share the same ``data_dir`` (it is
+#: keyed by profile name, not by session/PID), so independent server processes
+#: started by separate sessions all read/write the same ``profile.json`` and
+#: ``examples.db``. Without this lock, N concurrently-running sessions each
+#: redundantly re-walk and re-analyze the whole corpus on every corpus change.
+_REBUILD_LOCK_FILENAME: str = "build.lock"
+
+#: If ``profile.json`` was written less than this many seconds ago, treat a
+#: failed lock acquisition as "another process just finished building" rather
+#: than "building never happened" — safe to reuse its output instead of
+#: queuing behind the lock or redoing the work ourselves.
+_FRESH_REBUILD_STALENESS_SECONDS: float = 5.0
+
 
 # ---------------------------------------------------------------------------
 # Corpus collection + build (synchronous core, run off the event loop)
@@ -126,7 +160,8 @@ def _collect_corpus_files(config: StyleConfig) -> list[Path]:
 
     Directory sources are walked recursively; file sources are included directly.
     Only files whose suffix is in ``config.file_extensions`` are kept, and hidden
-    / Office-temp files and excluded path components are skipped. The result is
+    / Office-temp files and excluded path components are skipped. Exclude
+    entries may be literal components or globs (``*-master``, ``*.azw.md``). The result is
     de-duplicated and sorted for deterministic ordering.
 
     Args:
@@ -160,21 +195,133 @@ def _collect_corpus_files(config: StyleConfig) -> list[Path]:
     return sorted(found)
 
 
+def _extract_text_cached(path: Path) -> Optional[str]:
+    """Extract text from ``path``, reusing ``_extract_cache`` when unchanged.
+
+    A cache hit requires both the file's mtime and size to match what was
+    recorded at the previous extraction; either changing invalidates the entry
+    and forces a fresh ``extract_text`` call. This is the single extraction
+    point for a corpus build — both the style profile and the excerpt index
+    consume its result — so each changed file is read and parsed once per
+    rebuild, and an unchanged file is not re-parsed at all.
+
+    Args:
+        path: Corpus file to extract.
+
+    Returns:
+        The extracted text, or ``None`` if the file is unreadable/unstattable
+        or extraction yields nothing.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+
+    cached = _extract_cache.get(path)
+    if (
+        cached is not None
+        and cached[0] == stat.st_mtime_ns
+        and cached[1] == stat.st_size
+    ):
+        return cached[2]
+
+    text = extract_text(path)
+    if text:
+        _extract_cache[path] = (stat.st_mtime_ns, stat.st_size, text)
+    else:
+        _extract_cache.pop(path, None)
+    return text
+
+
+def _profile_is_fresh(config: StyleConfig) -> bool:
+    """Whether ``profile.json`` was written within the last few seconds.
+
+    Args:
+        config: The resolved active-profile configuration.
+
+    Returns:
+        ``True`` if the file exists and its mtime is within
+        :data:`_FRESH_REBUILD_STALENESS_SECONDS` of now.
+    """
+    try:
+        mtime = config.profile_path.stat().st_mtime
+    except OSError:
+        return False
+    return (time.time() - mtime) < _FRESH_REBUILD_STALENESS_SECONDS
+
+
+def _try_acquire_build_lock(config: StyleConfig) -> Optional[IO[str]]:
+    """Try to acquire the cross-process build lock; ``None`` if unavailable.
+
+    Uses a non-blocking ``flock`` on a lock file inside ``profile_dir`` so that
+    when several independent server processes (one per Claude Code session,
+    all sharing the same ``data_dir``) each want to rebuild the same corpus at
+    once, only one actually does the work. On platforms without ``fcntl``
+    (non-POSIX), locking is skipped entirely and every caller proceeds to build
+    — the pre-existing, non-regressed behavior.
+
+    Args:
+        config: The resolved active-profile configuration.
+
+    Returns:
+        The open, locked file handle (caller must close it, which releases the
+        lock) on success; ``None`` if another process already holds it or
+        locking is unavailable on this platform.
+    """
+    if fcntl is None:  # pragma: no cover - exercised only on non-POSIX platforms
+        return None
+
+    config.profile_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = config.profile_dir / _REBUILD_LOCK_FILENAME
+    handle = open(lock_path, "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def _release_build_lock(handle: Optional[IO[str]]) -> None:
+    """Release and close a lock handle from :func:`_try_acquire_build_lock`."""
+    if handle is None:
+        return
+    if fcntl is not None:  # pragma: no branch - fcntl is None only on non-POSIX
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        except OSError:  # pragma: no cover - best-effort unlock
+            pass
+    handle.close()
+
+
 def _build_corpus_sync(force_reindex: bool = False) -> dict:
     """Build the StyleProfile and excerpt index from the configured corpus.
 
     This is the synchronous core invoked from a worker thread. It collects the
-    corpus, computes the profile, persists ``profile.json``, updates the live
-    ``_profile`` global, and (re)indexes excerpts into ``examples.db``. With
-    ``force_reindex=True`` the excerpt index is cleared and rebuilt from scratch;
-    otherwise the index's MD5 change-detection skips unchanged files.
+    corpus, extracts each file's text exactly once (via the in-process
+    :data:`_extract_cache`, so unchanged files since the last build in this
+    process are not re-parsed), computes the profile from that already-extracted
+    text, persists ``profile.json``, updates the live ``_profile`` global, and
+    (re)indexes excerpts into ``examples.db``. With ``force_reindex=True`` the
+    excerpt index is cleared and rebuilt from scratch; otherwise the index's own
+    MD5 change-detection skips unchanged files.
+
+    Independent server processes (one per Claude Code session) share the same
+    ``data_dir``/``profile.json``/``examples.db``. Before doing the work, this
+    tries a non-blocking cross-process lock (:func:`_try_acquire_build_lock`);
+    if another process already holds it, this reuses the on-disk
+    ``profile.json`` that process just wrote (or is about to) rather than
+    redundantly re-walking and re-analyzing the same corpus.
 
     Args:
         force_reindex: Rebuild the excerpt index from scratch when ``True``.
 
     Returns:
         A summary dict (``doc_count``, ``total_words``, ``source_count``,
-        ``generated_at``, ``profile_path`` (relative), headline metrics).
+        ``generated_at``, ``profile_path`` (relative), headline metrics). When
+        another process's build was reused instead, ``status`` is
+        ``"reused_existing"`` and ``excerpts_indexed`` is omitted (the shared
+        index was not touched by this process).
 
     Raises:
         RuntimeError: If the server config/index are not initialized.
@@ -184,73 +331,144 @@ def _build_corpus_sync(force_reindex: bool = False) -> dict:
     if _config is None or _index is None:
         raise RuntimeError("Server state not initialized; cannot build corpus.")
 
-    # Serialize the whole build so concurrent callers (startup task, an explicit
-    # analyze_writing_style, the watcher thread) never write the index at once.
+    config = _config
+
+    # Serialize the whole build so concurrent callers *within this process*
+    # (startup task, an explicit analyze_writing_style, the watcher thread)
+    # never write the index at once.
     with _build_thread_lock:
-        files = _collect_corpus_files(_config)
+        lock_handle = _try_acquire_build_lock(config)
+        if lock_handle is None and _profile_is_fresh(config):
+            reloaded = StyleProfile.load(config.profile_path)
+            if reloaded is not None:
+                _profile = reloaded
+                logger.info(
+                    "Corpus build already in progress in another process; "
+                    "reused its profile.json instead of rebuilding."
+                )
+                meta = reloaded.metadata
+                return {
+                    "status": "reused_existing",
+                    "doc_count": meta.get("doc_count", 0),
+                    "total_words": meta.get("total_words", 0),
+                    "source_count": meta.get("source_count", 0),
+                    "generated_at": meta.get("generated_at"),
+                    "profile_path": str(
+                        Path(config.profile_name) / config.profile_path.name
+                    ),
+                    "avg_sentence_length": reloaded.avg_sentence_length,
+                    "median_sentence_length": reloaded.median_sentence_length,
+                    "lexical_diversity": reloaded.lexical_diversity,
+                }
+            # Lock unavailable and nothing usable on disk yet (e.g. the very
+            # first build racing across sessions): fall through and build.
 
-        # 0) Extract once. A file that yields no text is unreadable: most often a
-        #    cloud-only placeholder (OneDrive / Google Drive "Files On-Demand")
-        #    whose read times out because the sync client did not download it.
-        #    Count these instead of dropping them silently.
-        pairs: list[tuple[str, str]] = []
-        readable: list[Path] = []
-        for path in files:
-            text = extract_text(path)
-            if text and text.strip():
+        try:
+            files = _collect_corpus_files(config)
+
+            # 0) Extract once, then admit. A file that yields no text is
+            #    unreadable: most often a cloud-only placeholder (OneDrive /
+            #    Google Drive "Files On-Demand") whose read times out because the
+            #    sync client did not download it. Count these instead of dropping
+            #    them silently.
+            #
+            #    A .md suffix is not a promise of prose: a renamed ebook, a syslog
+            #    or a topology dump poisons every metric in the profile, and
+            #    duplicated copies of one document multiply whatever they contain.
+            #    Reject both here, once, so the profile and the excerpt index see
+            #    the same admitted set.
+            per_doc_texts: list[str] = []
+            basenames: list[str] = []
+            pairs: list[tuple[str, str]] = []
+            skipped_unreadable = 0
+            skipped_reasons: Counter[str] = Counter()
+            seen_hashes: set[str] = set()
+            duplicates = 0
+            for path in files:
+                text = _extract_text_cached(path)
+                if not text or not text.strip():
+                    skipped_unreadable += 1
+                    continue
+                verdict = is_prose(text)
+                if not verdict.ok:
+                    skipped_reasons[verdict.reason or "not-prose"] += 1
+                    logger.debug("Skipping %s (%s)", path.name, verdict.reason)
+                    continue
+                digest = hashlib.md5(text.encode("utf-8")).hexdigest()
+                if digest in seen_hashes:
+                    duplicates += 1
+                    logger.debug("Skipping duplicate content: %s", path.name)
+                    continue
+                seen_hashes.add(digest)
+                per_doc_texts.append(text)
+                basenames.append(path.name)
                 pairs.append((str(path), text))
-                readable.append(path)
-        skipped_unreadable = len(files) - len(readable)
-        if skipped_unreadable:
-            logger.warning(
-                "%d of %d corpus files could not be read (cloud-only placeholders "
-                "time out until the sync client downloads them)",
-                skipped_unreadable,
-                len(files),
+
+            if skipped_unreadable:
+                logger.warning(
+                    "%d of %d corpus files could not be read (cloud-only placeholders "
+                    "time out until the sync client downloads them)",
+                    skipped_unreadable,
+                    len(files),
+                )
+            if skipped_reasons or duplicates:
+                logger.info(
+                    "Corpus admission: %d of %d files admitted (non-prose: %s; duplicates: %d)",
+                    len(per_doc_texts),
+                    len(files),
+                    dict(skipped_reasons) or "none",
+                    duplicates,
+                )
+
+            # 1) Compute the StyleProfile. Do not let a build that could read
+            #    only a small part of the corpus replace a fuller profile on disk.
+            profile = analyze_documents(
+                per_doc_texts,
+                config.profile_name,
+                source_paths=[Path(name) for name in basenames],
+                source_count=len(files),
             )
-
-        # 1) Compute the StyleProfile. Do not let a build that could read only a
-        #    small part of the corpus replace a fuller profile on disk.
-        profile = analyze_corpus(readable, _config.profile_name)
-        kept = (
-            _profile
-            if _profile is not None
-            else StyleProfile.load(_config.profile_path)
-        )
-        if (
-            files
-            and skipped_unreadable / len(files) > UNREADABLE_KEEP_PROFILE_RATIO
-            and kept is not None
-            and kept.metadata.get("doc_count", 0) > profile.metadata.get("doc_count", 0)
-        ):
-            logger.warning(
-                "Keeping the existing profile: this build read only %d of %d files",
-                len(readable),
-                len(files),
+            kept = (
+                _profile
+                if _profile is not None
+                else StyleProfile.load(config.profile_path)
             )
-            _profile = kept
-            return {
-                "status": "degraded",
-                "reason": (
-                    "Most corpus files could not be read, so the existing, fuller "
-                    "profile was kept. Download cloud-only files locally and rebuild."
-                ),
-                "doc_count": kept.metadata.get("doc_count", 0),
-                "source_count": len(files),
-                "skipped_unreadable": skipped_unreadable,
-                "generated_at": kept.metadata.get("generated_at"),
-            }
-        profile.save(_config.profile_path)
-        _profile = profile
+            if (
+                files
+                and skipped_unreadable / len(files) > UNREADABLE_KEEP_PROFILE_RATIO
+                and kept is not None
+                and kept.metadata.get("doc_count", 0)
+                > profile.metadata.get("doc_count", 0)
+            ):
+                logger.warning(
+                    "Keeping the existing profile: this build read only %d of %d files",
+                    len(files) - skipped_unreadable,
+                    len(files),
+                )
+                _profile = kept
+                return {
+                    "status": "degraded",
+                    "reason": (
+                        "Most corpus files could not be read, so the existing, fuller "
+                        "profile was kept. Download cloud-only files locally and rebuild."
+                    ),
+                    "doc_count": kept.metadata.get("doc_count", 0),
+                    "source_count": len(files),
+                    "skipped_unreadable": skipped_unreadable,
+                    "generated_at": kept.metadata.get("generated_at"),
+                }
+            profile.save(config.profile_path)
+            _profile = profile
 
-        # 2) (Re)build the excerpt index from already-extracted (path, text) pairs.
-        #    force_reindex drops everything via the index's public clear() (no
-        #    reaching into private internals) and rebuilds from scratch.
-        if force_reindex:
-            _index.clear()
-
-        index_summary = _index.index_files(pairs)
-        logger.info("Excerpt index updated: %s", index_summary)
+            # 2) (Re)build the excerpt index from the same admitted pairs.
+            #    force_reindex drops everything via the index's public clear()
+            #    and rebuilds from scratch.
+            if force_reindex:
+                _index.clear()
+            index_summary = _index.index_files(pairs)
+            logger.info("Excerpt index updated: %s", index_summary)
+        finally:
+            _release_build_lock(lock_handle)
 
     meta = profile.metadata
     return {
@@ -260,12 +478,17 @@ def _build_corpus_sync(force_reindex: bool = False) -> dict:
         "source_count": meta.get("source_count", 0),
         "generated_at": meta.get("generated_at"),
         # Relative form only — never an absolute author path.
-        "profile_path": str(Path(_config.profile_name) / _config.profile_path.name),
+        "profile_path": str(Path(config.profile_name) / config.profile_path.name),
         "avg_sentence_length": profile.avg_sentence_length,
         "median_sentence_length": profile.median_sentence_length,
         "lexical_diversity": profile.lexical_diversity,
         "excerpts_indexed": index_summary.get("excerpts", 0),
         "skipped_unreadable": skipped_unreadable,
+        # What the admission gate threw away, so a corrupted corpus is visible
+        # in the build result instead of only in the logs.
+        "skipped_non_prose": sum(skipped_reasons.values()),
+        "skipped_reasons": dict(skipped_reasons),
+        "skipped_duplicates": duplicates,
     }
 
 
@@ -938,6 +1161,9 @@ def _reset_state_for_tests() -> None:
     _watcher = None
     _profile = None
     _build_task = None
+    # Tests use distinct tmp_path corpora, so a stale cache entry from a prior
+    # test (same basename, different tmp dir) must never leak across tests.
+    _extract_cache.clear()
     # Recreate the readiness event so it is not bound to a closed event loop
     # from a previous test; a fresh Event binds lazily to the current loop.
     global _profile_ready
