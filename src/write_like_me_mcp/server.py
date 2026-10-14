@@ -71,6 +71,10 @@ logger = logging.getLogger(__name__)
 #: structured ``"building"`` status. Module-level so tests can patch it short.
 READINESS_TIMEOUT_SECONDS: float = 30.0
 
+#: When more than this share of the collected corpus files cannot be read, a
+#: rebuild does not overwrite an existing profile built from more documents.
+UNREADABLE_KEEP_PROFILE_RATIO: float = 0.5
+
 #: Readiness state strings returned to callers.
 READINESS_READY: str = "ready"
 READINESS_BUILDING: str = "building"
@@ -185,8 +189,57 @@ def _build_corpus_sync(force_reindex: bool = False) -> dict:
     with _build_thread_lock:
         files = _collect_corpus_files(_config)
 
-        # 1) Compute and persist the StyleProfile.
-        profile = analyze_corpus(files, _config.profile_name)
+        # 0) Extract once. A file that yields no text is unreadable: most often a
+        #    cloud-only placeholder (OneDrive / Google Drive "Files On-Demand")
+        #    whose read times out because the sync client did not download it.
+        #    Count these instead of dropping them silently.
+        pairs: list[tuple[str, str]] = []
+        readable: list[Path] = []
+        for path in files:
+            text = extract_text(path)
+            if text and text.strip():
+                pairs.append((str(path), text))
+                readable.append(path)
+        skipped_unreadable = len(files) - len(readable)
+        if skipped_unreadable:
+            logger.warning(
+                "%d of %d corpus files could not be read (cloud-only placeholders "
+                "time out until the sync client downloads them)",
+                skipped_unreadable,
+                len(files),
+            )
+
+        # 1) Compute the StyleProfile. Do not let a build that could read only a
+        #    small part of the corpus replace a fuller profile on disk.
+        profile = analyze_corpus(readable, _config.profile_name)
+        kept = (
+            _profile
+            if _profile is not None
+            else StyleProfile.load(_config.profile_path)
+        )
+        if (
+            files
+            and skipped_unreadable / len(files) > UNREADABLE_KEEP_PROFILE_RATIO
+            and kept is not None
+            and kept.metadata.get("doc_count", 0) > profile.metadata.get("doc_count", 0)
+        ):
+            logger.warning(
+                "Keeping the existing profile: this build read only %d of %d files",
+                len(readable),
+                len(files),
+            )
+            _profile = kept
+            return {
+                "status": "degraded",
+                "reason": (
+                    "Most corpus files could not be read, so the existing, fuller "
+                    "profile was kept. Download cloud-only files locally and rebuild."
+                ),
+                "doc_count": kept.metadata.get("doc_count", 0),
+                "source_count": len(files),
+                "skipped_unreadable": skipped_unreadable,
+                "generated_at": kept.metadata.get("generated_at"),
+            }
         profile.save(_config.profile_path)
         _profile = profile
 
@@ -196,11 +249,6 @@ def _build_corpus_sync(force_reindex: bool = False) -> dict:
         if force_reindex:
             _index.clear()
 
-        pairs: list[tuple[str, str]] = []
-        for path in files:
-            text = extract_text(path)
-            if text and text.strip():
-                pairs.append((str(path), text))
         index_summary = _index.index_files(pairs)
         logger.info("Excerpt index updated: %s", index_summary)
 
@@ -217,6 +265,7 @@ def _build_corpus_sync(force_reindex: bool = False) -> dict:
         "median_sentence_length": profile.median_sentence_length,
         "lexical_diversity": profile.lexical_diversity,
         "excerpts_indexed": index_summary.get("excerpts", 0),
+        "skipped_unreadable": skipped_unreadable,
     }
 
 

@@ -436,3 +436,51 @@ async def test_non_active_profile_returns_error(configured):
     # The active profile name still works.
     raw_ok = await server.get_style_profile(server.GetProfileInput(profile="default"))
     assert json.loads(raw_ok).get("status") != "error"
+
+
+# ---------------------------------------------------------------------------
+# Unreadable corpus files (cloud-only placeholders that time out on read)
+# ---------------------------------------------------------------------------
+
+
+def _fail_extraction_for(monkeypatch, names: set[str]) -> None:
+    """Make extraction return ``None`` for files whose basename is in ``names``.
+
+    Mirrors a cloud-only OneDrive placeholder: the extractor catches the
+    ``[Errno 60] Operation timed out`` read error and returns ``None``.
+    """
+    from write_like_me_mcp import extractors, style_analyzer
+
+    real = extractors.extract_text
+
+    def _fake(path):
+        return None if Path(path).name in names else real(path)
+
+    monkeypatch.setattr(server, "extract_text", _fake)
+    monkeypatch.setattr(style_analyzer, "extract_text", _fake)
+
+
+@pytest.mark.asyncio
+async def test_build_reports_unreadable_files(configured, monkeypatch):
+    """A build counts the files it could not read instead of dropping them silently."""
+    _fail_extraction_for(monkeypatch, {"doc3.txt"})
+    out = json.loads(await server.analyze_writing_style(server.AnalyzeInput()))
+    assert out["status"] == "built"
+    assert out["doc_count"] == 2
+    assert out["skipped_unreadable"] == 1
+
+
+@pytest.mark.asyncio
+async def test_build_keeps_profile_when_most_files_unreadable(configured, monkeypatch):
+    """A build that cannot read most of the corpus does not replace a fuller profile."""
+    first = json.loads(await server.analyze_writing_style(server.AnalyzeInput()))
+    assert first["doc_count"] == 3
+    before = configured.profile_path.read_text(encoding="utf-8")
+
+    _fail_extraction_for(monkeypatch, {"doc2.txt", "doc3.txt"})
+    out = json.loads(await server.analyze_writing_style(server.AnalyzeInput()))
+
+    assert out["status"] == "degraded"
+    assert out["skipped_unreadable"] == 2
+    assert out["doc_count"] == 3  # the kept profile, not the 1-document rebuild
+    assert configured.profile_path.read_text(encoding="utf-8") == before
