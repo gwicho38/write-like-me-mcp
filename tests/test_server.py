@@ -245,6 +245,115 @@ async def test_analyze_writing_style_writes_artifacts_and_summary(configured):
 
 
 # ---------------------------------------------------------------------------
+# _extract_text_cached: unchanged files are not re-extracted on rebuild
+# ---------------------------------------------------------------------------
+
+
+def test_extract_text_cached_skips_unchanged_file(configured, monkeypatch):
+    """A second build within the same process does not re-extract unchanged files.
+
+    Regression test for the "every corpus-global rebuild re-parses every file"
+    cost: before this fix, two consecutive ``_build_corpus_sync`` calls with no
+    file changes would call ``extract_text`` once per file *per call* (and
+    twice per call before the analyze/index double-extraction was also
+    removed). Now an unchanged file is extracted at most once per process.
+    """
+    from write_like_me_mcp import extractors
+
+    call_counts: dict[Path, int] = {}
+    real_extract_text = extractors.extract_text
+
+    def _counting_extract_text(path: Path):
+        call_counts[path] = call_counts.get(path, 0) + 1
+        return real_extract_text(path)
+
+    monkeypatch.setattr(server, "extract_text", _counting_extract_text)
+
+    server._build_corpus_sync(force_reindex=False)
+    first_counts = dict(call_counts)
+    assert first_counts  # every corpus file was extracted at least once
+
+    server._build_corpus_sync(force_reindex=False)
+
+    # No file changed between the two builds, so no file's extract_text call
+    # count increased on the second build.
+    for path, count in first_counts.items():
+        assert call_counts[path] == count, f"{path} was re-extracted unnecessarily"
+
+
+def test_extract_text_cached_re_extracts_after_file_changes(configured, monkeypatch):
+    """A changed file (new mtime/size) is re-extracted; unchanged siblings are not."""
+    from write_like_me_mcp import extractors
+
+    call_counts: dict[Path, int] = {}
+    real_extract_text = extractors.extract_text
+
+    def _counting_extract_text(path: Path):
+        call_counts[path] = call_counts.get(path, 0) + 1
+        return real_extract_text(path)
+
+    monkeypatch.setattr(server, "extract_text", _counting_extract_text)
+
+    server._build_corpus_sync(force_reindex=False)
+    first_counts = dict(call_counts)
+
+    changed_path = next(iter(first_counts))
+    changed_path.write_text("Brand new content. New sentence here.\n", encoding="utf-8")
+
+    server._build_corpus_sync(force_reindex=False)
+
+    assert call_counts[changed_path] == first_counts[changed_path] + 1
+    for path, count in first_counts.items():
+        if path != changed_path:
+            assert call_counts[path] == count
+
+
+# ---------------------------------------------------------------------------
+# Cross-process build lock: reuse another process's fresh profile.json
+# ---------------------------------------------------------------------------
+
+
+def test_build_reuses_existing_profile_when_lock_held_elsewhere(
+    configured, monkeypatch
+):
+    """When another OS process holds the build lock, reuse its fresh profile.json.
+
+    Simulates a second independent server process (a second Claude Code
+    session) already rebuilding the shared corpus: an external file handle
+    holds the exclusive, non-blocking lock on ``build.lock`` before this
+    process's build runs. The build must not redo the (expensive) extraction
+    work and must instead return ``"reused_existing"`` from the on-disk
+    profile.
+    """
+    import fcntl
+
+    # First, build for real so a fresh profile.json exists on disk.
+    server._build_corpus_sync(force_reindex=False)
+
+    # Now simulate another process already holding the lock.
+    configured.profile_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = configured.profile_dir / server._REBUILD_LOCK_FILENAME
+    external_handle = open(lock_path, "a+")
+    fcntl.flock(external_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+
+        def _fail_if_called(path: Path):
+            raise AssertionError(
+                "extract_text should not be called when reusing another "
+                "process's fresh profile.json"
+            )
+
+        monkeypatch.setattr(server, "extract_text", _fail_if_called)
+
+        result = server._build_corpus_sync(force_reindex=False)
+        assert result["status"] == "reused_existing"
+        assert result["doc_count"] >= 1
+    finally:
+        fcntl.flock(external_handle, fcntl.LOCK_UN)
+        external_handle.close()
+
+
+# ---------------------------------------------------------------------------
 # apply_style
 # ---------------------------------------------------------------------------
 
@@ -457,6 +566,9 @@ def _fail_extraction_for(monkeypatch, names: set[str]) -> None:
         return None if Path(path).name in names else real(path)
 
     monkeypatch.setattr(server, "extract_text", _fake)
+    # A fresh extraction cache, so an earlier build's cached text cannot mask
+    # the simulated read failure.
+    monkeypatch.setattr(server, "_extract_cache", {})
     monkeypatch.setattr(style_analyzer, "extract_text", _fake)
 
 
@@ -484,3 +596,98 @@ async def test_build_keeps_profile_when_most_files_unreadable(configured, monkey
     assert out["skipped_unreadable"] == 2
     assert out["doc_count"] == 3  # the kept profile, not the 1-document rebuild
     assert configured.profile_path.read_text(encoding="utf-8") == before
+
+
+# ---------------------------------------------------------------------------
+# Corpus admission: junk and duplicates never reach the profile or the index
+# ---------------------------------------------------------------------------
+
+
+def _write_junk_corpus(source_dir: Path) -> dict[str, str]:
+    """Add the four file shapes that corrupted the real profile."""
+    junk = {
+        "ebook.md": "\x00\x01��" * 400 + "X-X-X-X-X-X-X-" * 200,
+        "topology.txt": "\n".join("0 0 1 0 1 1 0 0" for _ in range(200)),
+        "syslog.txt": " ".join(["token"] * 4000),
+    }
+    for name, text in junk.items():
+        (source_dir / name).write_text(text, encoding="utf-8")
+    return junk
+
+
+def test_build_skips_non_prose_files(configured):
+    """Binary blobs, data dumps and unsegmented logs never enter the profile."""
+    source_dir = Path(configured.resolved_sources[0])
+    _write_junk_corpus(source_dir)
+
+    summary = server._build_corpus_sync(force_reindex=True)
+
+    prose_docs = len(_CORPUS_DOCS)
+    assert summary["doc_count"] == prose_docs, (
+        "junk files were admitted to the corpus: "
+        f"{summary['doc_count']} docs for {prose_docs} prose files"
+    )
+    assert summary["source_count"] == prose_docs + 3
+
+
+def test_build_reports_what_it_rejected(configured):
+    """The build summary names the skipped files so corruption is visible."""
+    source_dir = Path(configured.resolved_sources[0])
+    _write_junk_corpus(source_dir)
+
+    summary = server._build_corpus_sync(force_reindex=True)
+
+    assert summary["skipped_non_prose"] == 3
+    assert set(summary["skipped_reasons"]) <= {
+        "binary",
+        "not-prose",
+        "unsegmented",
+        "encoded",
+        "too-short",
+    }
+
+
+def test_non_prose_is_not_searchable(configured):
+    """A rejected file must not surface through find_writing_examples either."""
+    source_dir = Path(configured.resolved_sources[0])
+    _write_junk_corpus(source_dir)
+
+    server._build_corpus_sync(force_reindex=True)
+
+    assert server._index is not None
+    indexed = {Path(p).name for p in server._index.indexed_paths()}
+    assert "ebook.md" not in indexed
+    assert "topology.txt" not in indexed
+    assert "syslog.txt" not in indexed
+
+
+def test_duplicate_documents_are_counted_once(configured):
+    """Eight copies of one file must not weigh eight times in the profile.
+
+    The real corpus held Moby Dick under eight different course-project paths;
+    every metric and every signature phrase was multiplied accordingly.
+    """
+    source_dir = Path(configured.resolved_sources[0])
+    original = sorted(source_dir.glob("*.txt"))[0]
+    body = original.read_text(encoding="utf-8")
+    for i in range(5):
+        (source_dir / f"copy_{i}.md").write_text(body, encoding="utf-8")
+
+    summary = server._build_corpus_sync(force_reindex=True)
+
+    assert summary["doc_count"] == len(_CORPUS_DOCS)
+    assert summary["skipped_duplicates"] == 5
+
+
+def test_collect_corpus_honours_glob_excludes(configured, tmp_path):
+    """A cloned third-party repo is excluded by shape, not by exact name."""
+    source_dir = Path(configured.resolved_sources[0])
+    cloned = source_dir / "SomeCourse-master"
+    cloned.mkdir()
+    (cloned / "notes.txt").write_text("Someone else wrote this. Not the author.\n")
+
+    configured.exclude.append("*-master")
+    found = {p.name for p in server._collect_corpus_files(configured)}
+
+    assert "notes.txt" not in found
+    assert "doc1.txt" in found

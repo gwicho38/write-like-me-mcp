@@ -87,6 +87,44 @@ def test_determinism_metric_fields_byte_equal_across_runs() -> None:
     assert json.dumps(da, sort_keys=True) == json.dumps(db, sort_keys=True)
 
 
+def test_analyze_documents_matches_analyze_corpus() -> None:
+    """analyze_documents on pre-extracted text == analyze_corpus on paths.
+
+    The server extracts each file once and feeds the same text to both the
+    profile and the excerpt index, so the in-memory entry point must produce
+    the same profile (aside from ``generated_at``) as the path-based one.
+    """
+    import json
+
+    paths = _corpus_paths()
+    texts = [p.read_text(encoding="utf-8") for p in paths]
+
+    via_paths = style_analyzer.analyze_corpus(paths, profile_name="test")
+    via_texts = style_analyzer.analyze_documents(
+        texts, "test", source_paths=paths, source_count=len(paths)
+    )
+
+    d1 = via_paths.to_dict()
+    d2 = via_texts.to_dict()
+    d1["metadata"].pop("generated_at", None)
+    d2["metadata"].pop("generated_at", None)
+
+    assert json.dumps(d1, sort_keys=True) == json.dumps(d2, sort_keys=True)
+
+
+def test_analyze_documents_source_count_includes_dropped_files() -> None:
+    """``source_count`` records files the caller dropped before analysis."""
+    paths = _corpus_paths()
+    texts = [p.read_text(encoding="utf-8") for p in paths]
+
+    profile = style_analyzer.analyze_documents(
+        texts, "test", source_paths=paths, source_count=len(paths) + 2
+    )
+
+    assert profile.metadata["source_count"] == len(paths) + 2
+    assert profile.metadata["doc_count"] == len(paths)
+
+
 def test_sentence_length_metrics_exact() -> None:
     """avg/median/distribution are exact on the known fixture."""
     profile = _build()

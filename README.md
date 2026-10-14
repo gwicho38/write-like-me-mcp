@@ -156,6 +156,40 @@ Instead of passing the config path as an argument:
 export WRITE_LIKE_ME_CONFIG="/path/to/your/write-like-me.json"
 ```
 
+## What Gets Into the Corpus
+
+A file extension is not a promise of prose, and prose is not a promise of *your*
+prose. Two independent gates decide what shapes a profile.
+
+**The prose gate (automatic).** Every extracted document is checked by
+`prose_filter.is_prose` before it reaches the profile or the excerpt index. A
+document is rejected when it is:
+
+| Reason | What it catches |
+|---|---|
+| `binary` | control characters or U+FFFD — a DRM'd ebook renamed `.md`, a truncated download |
+| `not-prose` | fewer than 55% of non-whitespace characters are letters — topology dumps, config, matrices |
+| `encoded` | more than 5% of tokens over 30 characters — base64, hashes, minified data |
+| `unsegmented` | over 80 words per sentence — syslogs and word lists with no terminal punctuation |
+| `too-short` | under 15 words — a stub cannot characterize a style |
+
+Identical documents are also collapsed by content hash, so eight copies of one
+file under eight project paths count once. Every build reports what it threw
+away in `skipped_non_prose`, `skipped_reasons` and `skipped_duplicates`, next to
+`skipped_unreadable` for files that yielded no text at all.
+
+**The exclude list (yours).** Whether a document is *your* writing is an
+authorship question no heuristic settles, so it lives in the profile's
+`exclude`. Entries are literal path components (`node_modules`) or globs
+(`*-master`, `*.azw.md`, `Solutions Manual*`) — third-party material in a
+personal corpus shares a shape more often than a name. Cloned course repos,
+ebooks, web clippings and starter code belong here.
+
+Left ungated, both failures are quiet and severe: a corpus of ~7,300 files that
+included published books, syslogs and one binary blob reported an average
+sentence of 62 words against a median of 12, and offered `"x x"` and `"0 0"` as
+the author's characteristic phrases.
+
 ## Supported File Types
 
 | Format | Extensions | Notes |

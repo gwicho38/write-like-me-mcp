@@ -754,6 +754,7 @@ def analyze_documents(
     documents: list[str],
     profile_name: str,
     source_paths: list[Path] | None = None,
+    source_count: int | None = None,
 ) -> StyleProfile:
     """Build a :class:`StyleProfile` from several in-memory documents.
 
@@ -767,6 +768,9 @@ def analyze_documents(
         profile_name: Name recorded in ``metadata.profile_name``.
         source_paths: Optional source paths; only their **basenames** are
             recorded (privacy invariant).
+        source_count: Total number of source files considered, including any
+            the caller dropped before analysis (unreadable, not prose,
+            duplicate). Defaults to the number of ``source_paths``.
 
     Returns:
         A computed :class:`StyleProfile` (no verbatim text persisted).
@@ -776,7 +780,7 @@ def analyze_documents(
         per_doc_texts=documents,
         profile_name=profile_name,
         source_basenames=basenames,
-        source_count=len(basenames),
+        source_count=len(basenames) if source_count is None else source_count,
     )
 
 
