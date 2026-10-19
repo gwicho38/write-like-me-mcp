@@ -369,3 +369,34 @@ class TestIsExcluded:
         """The README documents ``"drafts/"``; a trailing separator must not
         stop it matching the ``drafts`` component."""
         assert is_excluded(Path("/corpus/drafts/wip.md"), ["drafts/"])
+
+
+# ---------------------------------------------------------------------------
+# Cloud-only (dataless) placeholder detection
+# ---------------------------------------------------------------------------
+
+
+class TestIsCloudOnly:
+    """``is_cloud_only`` reads the stat flag only; it never opens the file."""
+
+    def test_dataless_flag_means_cloud_only(self, tmp_path, monkeypatch) -> None:
+        from write_like_me_mcp import config as config_mod
+
+        target = tmp_path / "essay.md"
+        target.write_text("x", encoding="utf-8")
+        monkeypatch.setattr(
+            config_mod, "_stat_flags", lambda _p: config_mod.SF_DATALESS
+        )
+        assert config_mod.is_cloud_only(target) is True
+
+    def test_local_file_is_not_cloud_only(self, tmp_path) -> None:
+        from write_like_me_mcp.config import is_cloud_only
+
+        target = tmp_path / "essay.md"
+        target.write_text("x", encoding="utf-8")
+        assert is_cloud_only(target) is False
+
+    def test_missing_file_is_not_cloud_only(self, tmp_path) -> None:
+        from write_like_me_mcp.config import is_cloud_only
+
+        assert is_cloud_only(tmp_path / "gone.md") is False

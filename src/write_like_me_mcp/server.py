@@ -52,7 +52,13 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
-from .config import ConfigError, StyleConfig, is_excluded, load_config
+from .config import (
+    ConfigError,
+    StyleConfig,
+    is_cloud_only,
+    is_excluded,
+    load_config,
+)
 from .extractors import extract_text
 from .indexer import ExcerptIndex
 from .model import StyleProfile
@@ -381,10 +387,17 @@ def _build_corpus_sync(force_reindex: bool = False) -> dict:
             basenames: list[str] = []
             pairs: list[tuple[str, str]] = []
             skipped_unreadable = 0
+            skipped_cloud_only = 0
             skipped_reasons: Counter[str] = Counter()
             seen_hashes: set[str] = set()
             duplicates = 0
             for path in files:
+                # Never open a cloud-only placeholder: the read makes the sync
+                # client download it, and one build per session over thousands
+                # of placeholders fills the disk (issue #8).
+                if is_cloud_only(path):
+                    skipped_cloud_only += 1
+                    continue
                 text = _extract_text_cached(path)
                 if not text or not text.strip():
                     skipped_unreadable += 1
@@ -404,6 +417,13 @@ def _build_corpus_sync(force_reindex: bool = False) -> dict:
                 basenames.append(path.name)
                 pairs.append((str(path), text))
 
+            if skipped_cloud_only:
+                logger.info(
+                    "%d of %d corpus files are cloud-only placeholders and were not "
+                    "read (mark them 'Always keep on this device' to include them)",
+                    skipped_cloud_only,
+                    len(files),
+                )
             if skipped_unreadable:
                 logger.warning(
                     "%d of %d corpus files could not be read (cloud-only placeholders "
@@ -433,16 +453,17 @@ def _build_corpus_sync(force_reindex: bool = False) -> dict:
                 if _profile is not None
                 else StyleProfile.load(config.profile_path)
             )
+            not_read = skipped_unreadable + skipped_cloud_only
             if (
                 files
-                and skipped_unreadable / len(files) > UNREADABLE_KEEP_PROFILE_RATIO
+                and not_read / len(files) > UNREADABLE_KEEP_PROFILE_RATIO
                 and kept is not None
                 and kept.metadata.get("doc_count", 0)
                 > profile.metadata.get("doc_count", 0)
             ):
                 logger.warning(
                     "Keeping the existing profile: this build read only %d of %d files",
-                    len(files) - skipped_unreadable,
+                    len(files) - not_read,
                     len(files),
                 )
                 _profile = kept
@@ -455,6 +476,7 @@ def _build_corpus_sync(force_reindex: bool = False) -> dict:
                     "doc_count": kept.metadata.get("doc_count", 0),
                     "source_count": len(files),
                     "skipped_unreadable": skipped_unreadable,
+                    "skipped_cloud_only": skipped_cloud_only,
                     "generated_at": kept.metadata.get("generated_at"),
                 }
             profile.save(config.profile_path)
@@ -484,6 +506,7 @@ def _build_corpus_sync(force_reindex: bool = False) -> dict:
         "lexical_diversity": profile.lexical_diversity,
         "excerpts_indexed": index_summary.get("excerpts", 0),
         "skipped_unreadable": skipped_unreadable,
+        "skipped_cloud_only": skipped_cloud_only,
         # What the admission gate threw away, so a corrupted corpus is visible
         # in the build result instead of only in the logs.
         "skipped_non_prose": sum(skipped_reasons.values()),

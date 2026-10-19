@@ -66,6 +66,42 @@ DEFAULT_FILE_EXTENSIONS: list[str] = [
 DEFAULT_EXCLUDE: list[str] = []
 
 
+#: macOS ``st_flags`` bit set on a File Provider placeholder whose content is
+#: not on disk (OneDrive / Google Drive / iCloud "online-only" files). Reading
+#: such a file makes the sync client download it; stat-ing it does not. The
+#: kernel value is ``SF_DATALESS`` in ``<sys/stat.h>``; the ``stat`` module only
+#: exports it from Python 3.13.
+SF_DATALESS: int = 0x40000000
+
+
+# ---------------------------------------------------------------------------
+# Cloud-only placeholder detection
+# ---------------------------------------------------------------------------
+
+
+def _stat_flags(path: Path) -> int:
+    """Return the BSD ``st_flags`` of ``path`` (``0`` where unsupported)."""
+    return int(getattr(os.stat(path), "st_flags", 0))
+
+
+def is_cloud_only(path: Path) -> bool:
+    """Return whether ``path`` is a cloud-only placeholder with no local data.
+
+    Uses the stat flag only, so the check never triggers a download. Missing
+    or unstattable paths are not cloud-only; the caller handles them as before.
+
+    Args:
+        path: Candidate corpus path.
+
+    Returns:
+        ``True`` when the file's content lives only in the cloud.
+    """
+    try:
+        return bool(_stat_flags(path) & SF_DATALESS)
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Exclusion matching
 # ---------------------------------------------------------------------------
