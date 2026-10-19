@@ -49,7 +49,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver
 
-from .config import StyleConfig, is_excluded
+from .config import StyleConfig, is_cloud_only, is_excluded
 
 # ---------------------------------------------------------------------------
 # Named constants (no magic literals)
@@ -177,7 +177,11 @@ class _DebouncedHandler(FileSystemEventHandler):
         # Only configured analyzed extensions are relevant.
         if file_path.suffix.lower() not in self._config.file_extensions:
             return False
-        return not is_excluded(file_path, self._config.exclude)
+        if is_excluded(file_path, self._config.exclude):
+            return False
+        # A file turning into a cloud-only placeholder is the sync client
+        # evicting it, not an edit. Rebuilding on it only churns (issue #8).
+        return not is_cloud_only(file_path)
 
 
 # ---------------------------------------------------------------------------

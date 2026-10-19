@@ -691,3 +691,46 @@ def test_collect_corpus_honours_glob_excludes(configured, tmp_path):
 
     assert "notes.txt" not in found
     assert "doc1.txt" in found
+
+
+# ---------------------------------------------------------------------------
+# Cloud-only placeholders are never read (reading one forces a download)
+# ---------------------------------------------------------------------------
+
+
+def test_build_never_reads_cloud_only_files(configured, monkeypatch):
+    """A dataless placeholder is skipped by stat flag, not opened.
+
+    Opening one makes OneDrive / Google Drive download it. One build per
+    Claude session over thousands of placeholders filled the disk and got
+    OneDrive killed by the system cache purge (issue #8).
+    """
+    monkeypatch.setattr(server, "is_cloud_only", lambda p: p.name == "doc1.txt")
+    opened: list[str] = []
+    real_extract = server.extract_text
+
+    def spy(path):
+        opened.append(path.name)
+        return real_extract(path)
+
+    monkeypatch.setattr(server, "extract_text", spy)
+
+    summary = server._build_corpus_sync(force_reindex=True)
+
+    assert "doc1.txt" not in opened
+    assert summary["skipped_cloud_only"] == 1
+    assert summary["skipped_unreadable"] == 0
+    assert summary["doc_count"] == len(_CORPUS_DOCS) - 1
+
+
+def test_mostly_cloud_only_corpus_keeps_fuller_profile(configured, monkeypatch):
+    """Skipping placeholders must not let a thin build replace a full profile."""
+    full = server._build_corpus_sync(force_reindex=True)
+    assert full["doc_count"] == len(_CORPUS_DOCS)
+
+    monkeypatch.setattr(server, "is_cloud_only", lambda p: p.name != "doc3.txt")
+    summary = server._build_corpus_sync(force_reindex=True)
+
+    assert summary["status"] == "degraded"
+    assert summary["doc_count"] == len(_CORPUS_DOCS)
+    assert summary["skipped_cloud_only"] == len(_CORPUS_DOCS) - 1

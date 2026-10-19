@@ -196,3 +196,20 @@ def test_one_observer_schedule_per_source_root(tmp_path, monkeypatch):
 def test_default_debounce_constant_exposed():
     """The named debounce constant exists and matches the spec default (2s)."""
     assert DEFAULT_DEBOUNCE_SECONDS == 2.0
+
+
+def test_cloud_only_change_does_not_trigger_rebuild(tmp_path, monkeypatch):
+    """Eviction to a placeholder is sync churn, not an edit: no rebuild."""
+    from write_like_me_mcp import watcher as watcher_mod
+
+    src = tmp_path / "writing"
+    src.mkdir()
+    (src / "essay.md").write_text("x", encoding="utf-8")
+    config = _make_config(tmp_path, monkeypatch, [str(src)])
+    monkeypatch.setattr(watcher_mod, "is_cloud_only", lambda _p: True)
+
+    fired = threading.Event()
+    handler = _DebouncedHandler(config, fired.set, debounce_seconds=0.05)
+    handler.on_modified(_event(src / "essay.md"))
+
+    assert not fired.wait(timeout=0.3), "placeholder churn triggered a rebuild"
